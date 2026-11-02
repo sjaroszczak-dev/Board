@@ -232,7 +232,7 @@ let xC=null,mrC=null;
 function weekly(rows,start){
   const keys=Object.keys(rows[0]||{});
   const kDate=findKey(keys,/data|date|day|dzie/)||keys[0];
-  const kVal=keys.find(k=>k!==kDate&&/throughput|dostar|liczba|ilo|count|done|zako|tempo/i.test(String(k)))||keys.find(k=>k!==kDate&&rows.some(r=>typeof r[k]==='number'));
+  const kVal=keys.find(k=>k!==kDate&&/throughput|przepust|dostar|liczba|ilo|count|done|zako|tempo/i.test(String(k)))||keys.find(k=>k!==kDate&&rows.some(r=>typeof r[k]==='number'));
   const days=[];
   rows.forEach(r=>{
     const d=toDate(r[kDate]);if(!d)return;
