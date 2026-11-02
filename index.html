@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard przepływu pracy</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+header{padding:12px 24px;background:#1e293b}
+h1{margin:0;font-size:20px}
+nav{display:flex;gap:4px;padding:0 24px;background:#1e293b}
+nav button{background:none;border:0;color:#94a3b8;padding:10px 18px;cursor:pointer;font-size:15px;border-bottom:3px solid transparent}
+nav button.active{color:#fff;border-color:#38bdf8}
+.tab{display:none;padding:16px 24px}.tab.active{display:block}
+.bar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:12px}
+.card{background:#1e293b;border-radius:8px;padding:12px;margin-bottom:12px}
+.chartbox{position:relative;height:460px}
+.chartbox.small{height:300px}
+label{cursor:pointer}
+input,select,button.btn{background:#0f172a;color:#e2e8f0;border:1px solid #475569;border-radius:4px;padding:5px 8px}
+button.btn{cursor:pointer;background:#334155}
+.pill{padding:2px 8px;border-radius:10px;color:#0f172a;font-weight:600}
+.stats span{margin-right:18px}
+.muted{color:#94a3b8;font-size:13px}
+</style>
+</head>
+<body>
+<header><h1>Dashboard przepływu pracy</h1></header>
+<nav>
+  <button class="active" data-tab="lt">Czasy realizacji</button>
+  <button data-tab="xmr">Tempo dostarczania (XmR)</button>
+</nav>
+
+<section id="lt" class="tab active">
+  <div class="card bar">
+    <strong>Rozmiar:</strong>
+    <label><input type="checkbox" class="sz" value="S" checked> <span class="pill" style="background:#4ade80">S</span></label>
+    <label><input type="checkbox" class="sz" value="M" checked> <span class="pill" style="background:#38bdf8">M</span></label>
+    <label><input type="checkbox" class="sz" value="L" checked> <span class="pill" style="background:#fb923c">L</span></label>
+    <button class="btn" id="restoreAll">Przywróć usunięte</button>
+    <button class="btn" id="resetManual">Usuń ręczne rekordy</button>
+    <label class="btn" style="padding:5px 8px">Wczytaj XLSX <input type="file" id="ltFile" accept=".xlsx,.xls" hidden></label>
+  </div>
+  <div class="card bar">
+    <strong>Nowy rekord:</strong>
+    <input type="text" id="nName" placeholder="Nazwa (opcjonalnie)">
+    <select id="nSize"><option>S</option><option selected>M</option><option>L</option></select>
+    <input type="number" id="nDays" min="0" step="any" placeholder="Czas realizacji (dni)">
+    <input type="date" id="nDate">
+    <button class="btn" id="addBtn">Dodaj</button>
+  </div>
+  <div class="card stats" id="ltStats"></div>
+  <div class="card"><div class="chartbox"><canvas id="ltChart"></canvas></div>
+  <div class="muted">Kliknij kropkę powyżej P95, aby ją usunąć z obliczeń; kliknij szarą (usuniętą) kropkę, aby ją przywrócić. Świecące kropki leżą powyżej P95.</div></div>
+  <div class="muted" id="ltMsg"></div>
+</section>
+
+<section id="xmr" class="tab">
+  <div class="card bar">
+    <label>Początek tygodni: <input type="date" id="xStart"></label>
+    <label class="btn" style="padding:5px 8px">Wczytaj XLSX <input type="file" id="xFile" accept=".xlsx,.xls" hidden></label>
+    <span class="muted" id="xMsg"></span>
+  </div>
+  <div class="card stats" id="xStats"></div>
+  <div class="card"><div class="chartbox small"><canvas id="xChart"></canvas></div></div>
+  <div class="card"><div class="chartbox small"><canvas id="mrChart"></canvas></div></div>
+</section>
+
+<script>
+const COLORS={S:'#4ade80',M:'#38bdf8',L:'#fb923c'};
+const DAY=86400000;
+const $=s=>document.querySelector(s);
+const fmt=ms=>new Date(ms).toLocaleDateString('pl-PL');
+const iso=d=>{const x=new Date(d);return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0')};
+
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button,.tab').forEach(e=>e.classList.remove('active'));
+  b.classList.add('active');$('#'+b.dataset.tab).classList.add('active');
+  window.dispatchEvent(new Event('resize'));
+});
+
+// ---------- helpers ----------
+function toDate(v){
+  if(v instanceof Date&&!isNaN(v))return new Date(v.getFullYear(),v.getMonth(),v.getDate(),v.getHours()>=12?1:0);
+  if(typeof v==='number'&&v>20000&&v<80000)return new Date(Math.round((v-25569)*DAY)+new Date().getTimezoneOffset()*60000);
+  if(typeof v==='string'){
+    let m=v.trim().match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})/);
+    if(m)return new Date(+m[3],m[2]-1,+m[1]);
+    const d=new Date(v);if(!isNaN(d))return new Date(d.getFullYear(),d.getMonth(),d.getDate());
+  }
+  return null;
+}
+function readRows(buf){
+  const wb=XLSX.read(buf,{type:'array',cellDates:true});
+  return XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:null});
+}
+const findKey=(keys,re)=>keys.find(k=>re.test(String(k).toLowerCase()));
+async function fetchFirst(names){
+  for(const n of names){
+    try{const r=await fetch(encodeURI(n));if(r.ok)return await r.arrayBuffer();}catch(e){}
+  }
+  return null;
+}
+function percentile(sorted,p){
+  if(!sorted.length)return null;
+  const i=(sorted.length-1)*p,lo=Math.floor(i),hi=Math.ceil(i);
+  return sorted[lo]+(sorted[hi]-sorted[lo])*(i-lo);
+}
+
+// ---------- Part 1: lead time scatter ----------
+const LS={manual:'lt_manual',removed:'lt_removed'};
+let fileItems=[];
+let manual=JSON.parse(localStorage.getItem(LS.manual)||'[]');
+let removed=new Set(JSON.parse(localStorage.getItem(LS.removed)||'[]'));
+const saveLS=()=>{localStorage.setItem(LS.manual,JSON.stringify(manual));localStorage.setItem(LS.removed,JSON.stringify([...removed]))};
+
+function parseLeadRows(rows){
+  if(!rows.length)return[];
+  const keys=Object.keys(rows[0]);
+  const kSize=findKey(keys,/rozmiar|size|wielko/);
+  const kDays=findKey(keys,/czas|lead|cycle|dni|days/);
+  const kDate=findKey(keys,/zako|data|date|done|closed|end/);
+  const kName=findKey(keys,/nazw|name|tytu|title|id|key/);
+  const out=[];
+  rows.forEach((r,i)=>{
+    const days=parseFloat(String(r[kDays]).replace(',','.'));
+    const date=toDate(r[kDate]);
+    let size=String(r[kSize]||'').trim().toUpperCase();
+    if(!['S','M','L'].includes(size))size=size[0]&&['S','M','L'].includes(size[0])?size[0]:null;
+    if(isNaN(days)||!date||!size)return;
+    out.push({id:'f'+i,name:r[kName]!=null&&kName!==kDays&&kName!==kDate&&kName!==kSize?String(r[kName]):'',size,days,t:date.getTime()});
+  });
+  return out;
+}
+const allItems=()=>fileItems.concat(manual);
+const selSizes=()=>[...document.querySelectorAll('.sz:checked')].map(e=>e.value);
+
+const glowPlugin={
+  id:'glow',
+  beforeDatasetDraw(c,a){const d=c.data.datasets[a.index];if(d.glow){const ctx=c.ctx;ctx.save();ctx.shadowColor=d.borderColor;ctx.shadowBlur=10+8*Math.sin(Date.now()/250);}},
+  afterDatasetDraw(c,a){if(c.data.datasets[a.index].glow)c.ctx.restore();}
+};
+Chart.register(glowPlugin);
+
+const ltChart=new Chart($('#ltChart'),{
+  type:'scatter',data:{datasets:[]},
+  options:{
+    maintainAspectRatio:false,animation:false,
+    scales:{
+      x:{type:'linear',title:{display:true,text:'Data zakończenia',color:'#94a3b8'},ticks:{color:'#94a3b8',callback:v=>fmt(v)},grid:{color:'#334155'}},
+      y:{title:{display:true,text:'Czas realizacji (dni)',color:'#94a3b8'},beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'#334155'}}
+    },
+    plugins:{
+      legend:{labels:{color:'#e2e8f0',filter:i=>!i.text.startsWith('_')}},
+      tooltip:{callbacks:{label:c=>{const r=c.raw;return r.item?`${r.item.name||''} [${r.item.size}] ${r.item.days} dni, ${fmt(r.item.t)}`:`${c.dataset.label}: ${c.parsed.y.toFixed(1)}`}}}
+    },
+    onClick(e,els,chart){
+      const hit=chart.getElementsAtEventForMode(e,'nearest',{intersect:true},false)[0];
+      if(!hit)return;
+      const raw=chart.data.datasets[hit.datasetIndex].data[hit.index];
+      if(!raw.item||!raw.clickable)return;
+      removed.has(raw.item.id)?removed.delete(raw.item.id):removed.add(raw.item.id);
+      saveLS();renderLT();
+    },
+    onHover(e,els,chart){
+      const h=chart.getElementsAtEventForMode(e,'nearest',{intersect:true},false)[0];
+      e.native.target.style.cursor=h&&chart.data.datasets[h.datasetIndex].data[h.index].clickable?'pointer':'default';
+    }
+  }
+});
+setInterval(()=>{if($('#lt').classList.contains('active'))ltChart.draw()},60);
+
+function renderLT(){
+  const sizes=selSizes();
+  const vis=allItems().filter(i=>sizes.includes(i.size));
+  const active=vis.filter(i=>!removed.has(i.id));
+  const sorted=active.map(i=>i.days).sort((a,b)=>a-b);
+  const P={50:percentile(sorted,.5),85:percentile(sorted,.85),95:percentile(sorted,.95)};
+  const ds=[];
+  const pt=i=>({x:i.t,y:i.days,item:i});
+  for(const s of ['S','M','L']){
+    if(!sizes.includes(s))continue;
+    const mine=active.filter(i=>i.size===s);
+    const above=i=>P[95]!=null&&i.days>P[95];
+    ds.push({label:s,data:mine.filter(i=>!above(i)).map(i=>({...pt(i)})),backgroundColor:COLORS[s],borderColor:COLORS[s],pointRadius:5});
+    ds.push({label:'_'+s+' >P95',data:mine.filter(above).map(i=>({...pt(i),clickable:true})),backgroundColor:COLORS[s],borderColor:COLORS[s],pointRadius:7,glow:true});
+  }
+  ds.push({label:'Usunięte (kliknij, aby przywrócić)',data:vis.filter(i=>removed.has(i.id)).map(i=>({...pt(i),clickable:true})),backgroundColor:'rgba(148,163,184,.15)',borderColor:'#94a3b8',borderWidth:1.5,pointRadius:6,pointStyle:'crossRot'});
+  if(vis.length){
+    const xs=vis.map(i=>i.t),x0=Math.min(...xs),x1=Math.max(...xs);
+    const lc={50:'#e2e8f0',85:'#facc15',95:'#f87171'};
+    for(const p of [50,85,95])if(P[p]!=null)ds.push({type:'line',label:`P${p} = ${P[p].toFixed(1)} dni`,data:[{x:x0,y:P[p]},{x:x1,y:P[p]}],borderColor:lc[p],borderDash:[6,4],borderWidth:1.5,pointRadius:0});
+  }
+  ltChart.data.datasets=ds;ltChart.update();
+  $('#ltStats').innerHTML=`<span>Widoczne: <b>${vis.length}</b></span><span>W obliczeniach: <b>${active.length}</b></span><span>Usunięte: <b>${vis.length-active.length}</b></span>`+
+    [50,85,95].map(p=>`<span>P${p}: <b>${P[p]==null?'–':P[p].toFixed(1)+' dni'}</b></span>`).join('');
+}
+document.querySelectorAll('.sz').forEach(e=>e.onchange=renderLT);
+$('#restoreAll').onclick=()=>{removed.clear();saveLS();renderLT()};
+$('#resetManual').onclick=()=>{if(confirm('Usunąć wszystkie ręcznie dodane rekordy?')){manual=[];saveLS();renderLT()}};
+$('#nDate').value=iso(new Date());
+$('#addBtn').onclick=()=>{
+  const days=parseFloat($('#nDays').value),d=toDate($('#nDate').value);
+  if(isNaN(days)||days<0||!d){alert('Podaj czas realizacji i datę.');return}
+  manual.push({id:'m'+Date.now(),name:$('#nName').value||'(ręczny)',size:$('#nSize').value,days,t:d.getTime()});
+  $('#nName').value='';$('#nDays').value='';saveLS();renderLT();
+};
+function setLead(buf,label){
+  fileItems=parseLeadRows(readRows(buf));
+  $('#ltMsg').textContent=fileItems.length?`Wczytano ${fileItems.length} rekordów (${label}).`:'Nie rozpoznano kolumn (potrzebne: rozmiar S/M/L, czas realizacji, data zakończenia).';
+  renderLT();
+}
+$('#ltFile').onchange=async e=>{if(e.target.files[0])setLead(await e.target.files[0].arrayBuffer(),e.target.files[0].name)};
+
+// ---------- Part 2: XmR ----------
+let dailyRows=null;
+const cfg=(title,labels,vals,center,ucl,lcl,color)=>({
+  type:'line',
+  data:{labels,datasets:[
+    {label:title,data:vals,borderColor:color,backgroundColor:color,pointRadius:4,tension:0},
+    {label:'Średnia',data:labels.map(()=>center),borderColor:'#e2e8f0',pointRadius:0,borderWidth:1.5},
+    {label:'UCL',data:labels.map(()=>ucl),borderColor:'#f87171',borderDash:[6,4],pointRadius:0,borderWidth:1.5},
+    {label:'LCL',data:labels.map(()=>lcl),borderColor:'#f87171',borderDash:[6,4],pointRadius:0,borderWidth:1.5}
+  ]},
+  options:{maintainAspectRatio:false,animation:false,
+    scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'#334155'}},y:{ticks:{color:'#94a3b8'},grid:{color:'#334155'}}},
+    plugins:{legend:{labels:{color:'#e2e8f0'}}}}
+});
+let xC=null,mrC=null;
+function weekly(rows,start){
+  const keys=Object.keys(rows[0]||{});
+  const kDate=findKey(keys,/data|date|day|dzie/)||keys[0];
+  const kVal=keys.find(k=>k!==kDate&&/throughput|przepust|dostar|liczba|ilo|count|done|zako|tempo/i.test(String(k)))||keys.find(k=>k!==kDate&&rows.some(r=>typeof r[k]==='number'));
+  const days=[];
+  rows.forEach(r=>{
+    const d=toDate(r[kDate]);if(!d)return;
+    let v=kVal!=null?parseFloat(String(r[kVal]).replace(',','.')):1;
+    if(isNaN(v))v=kVal!=null?0:1;
+    days.push({t:d.getTime(),v});
+  });
+  if(!days.length)return null;
+  const s0=start.getTime();
+  const last=Math.max(...days.map(d=>d.t));
+  const nW=Math.floor((last-s0)/(7*DAY))+1;
+  if(nW<2)return null;
+  const sums=Array(nW).fill(0);
+  days.forEach(d=>{if(d.t>=s0){const w=Math.floor((d.t-s0)/(7*DAY));if(w<nW)sums[w]+=d.v}});
+  return{sums,labels:sums.map((_,i)=>fmt(s0+i*7*DAY)),mode:kVal!=null?`kolumna „${kVal}”`:'liczba wierszy'};
+}
+function renderX(){
+  if(!dailyRows)return;
+  const start=toDate($('#xStart').value);
+  const w=weekly(dailyRows,start);
+  if(!w){$('#xMsg').textContent='Za mało danych po wybranej dacie startu.';return}
+  $('#xMsg').textContent=`Agregacja tygodniowa od ${fmt(start)} (${w.mode}).`;
+  const x=w.sums,n=x.length;
+  const mr=x.slice(1).map((v,i)=>Math.abs(v-x[i]));
+  const mean=x.reduce((a,b)=>a+b,0)/n,mrBar=mr.reduce((a,b)=>a+b,0)/mr.length;
+  const xu=mean+2.66*mrBar,xl=mean-2.66*mrBar,mu=mrBar+3.27*mrBar,ml=mrBar-3.27*mrBar;
+  [xC,mrC].forEach(c=>c&&c.destroy());
+  xC=new Chart($('#xChart'),cfg('Tempo dostarczania / tydzień',w.labels,x,mean,xu,xl,'#38bdf8'));
+  mrC=new Chart($('#mrChart'),cfg('Moving Range',w.labels.slice(1),mr,mrBar,mu,ml,'#fb923c'));
+  xC.options.plugins.title={display:true,text:'Wykres X',color:'#e2e8f0'};
+  mrC.options.plugins.title={display:true,text:'Wykres MR',color:'#e2e8f0'};
+  xC.update();mrC.update();
+  $('#xStats').innerHTML=`<span>Średnia X: <b>${mean.toFixed(2)}</b></span><span>Śr. MR: <b>${mrBar.toFixed(2)}</b></span>`+
+    `<span>X: UCL <b>${xu.toFixed(2)}</b> / LCL <b>${xl.toFixed(2)}</b></span><span>MR: UCL <b>${mu.toFixed(2)}</b> / LCL <b>${ml.toFixed(2)}</b></span>`;
+}
+function setDaily(buf){dailyRows=readRows(buf);renderX()}
+$('#xStart').value=iso(new Date(new Date().getFullYear(),0,7));
+$('#xStart').onchange=renderX;
+$('#xFile').onchange=async e=>{if(e.target.files[0])setDaily(await e.target.files[0].arrayBuffer())};
+
+// ---------- init ----------
+(async()=>{
+  renderLT();
+  const lt=await fetchFirst(['data/lead_times.xlsx','data/lead-times.xlsx','data/czasy_realizacji.xlsx']);
+  if(lt)setLead(lt,'data/lead_times.xlsx');else $('#ltMsg').textContent='Brak pliku data/lead_times.xlsx – wczytaj XLSX ręcznie lub dodaj plik do repozytorium.';
+  const tp=await fetchFirst(['data/Throughput Daily.xlsx','data/throughput_daily.xlsx','data/Throughput_Daily.xlsx']);
+  if(tp){
+    const r=readRows(tp);
+    if(r.length){const k=findKey(Object.keys(r[0]),/data|date|day|dzie/)||Object.keys(r[0])[0];
+      const ds=r.map(x=>toDate(x[k])).filter(Boolean);
+      if(ds.length)$('#xStart').value=iso(new Date(Math.min(...ds).getFullYear(),0,7));}
+    dailyRows=r;renderX();
+  } else $('#xMsg').textContent='Brak pliku data/Throughput Daily.xlsx – wczytaj XLSX ręcznie.';
+})();
+</script>
+</body>
+</html>
